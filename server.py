@@ -216,7 +216,6 @@ def handle_client(conn, addr):
                 return aes_encrypt(session_key, text)
             return caesar(text, session_key)
 
-        # ---------- Operation and closing phases ----------
         pending_write_file = None
 
         while True:
