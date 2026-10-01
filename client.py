@@ -1,5 +1,3 @@
-
-
 import socket
 import struct
 import base64
@@ -12,138 +10,227 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as aes_padding
 
 
-
-
 def send_packet(conn, *fields):
-    payload = "|".join(fields).encode()
+    payload = "|".join(fields).encode("utf-8")
     conn.sendall(struct.pack("!I", len(payload)) + payload)
 
 
-def recv_packet(conn):
-    header = conn.recv(4)
-    if len(header) < 4:
-        return None
-    length = struct.unpack("!I", header)[0]
+def recv_exact(conn, amount):
+    """Receive exactly the requested number of bytes."""
     data = b""
-    while len(data) < length:
-        chunk = conn.recv(length - len(data))
+    while len(data) < amount:
+        chunk = conn.recv(amount - len(data))
         if not chunk:
             return None
         data += chunk
-    return data.decode().split("|")
+    return data
 
 
+def recv_packet(conn):
+    header = recv_exact(conn, 4)
+    if header is None:
+        return None
+
+    length = struct.unpack("!I", header)[0]
+    data = recv_exact(conn, length)
+    if data is None:
+        return None
+    return data.decode("utf-8").split("|")
 
 
 def caesar(text, shift):
     result = ""
     for ch in text:
-        if ch.isalpha():
-            base = ord('A') if ch.isupper() else ord('a')
-            ch = chr((ord(ch) - base + shift) % 26 + base)
-        result += ch
+        if "A" <= ch <= "Z":
+            result += chr((ord(ch) - ord("A") + shift) % 26 + ord("A"))
+        elif "a" <= ch <= "z":
+            result += chr((ord(ch) - ord("a") + shift) % 26 + ord("a"))
+        else:
+            result += ch
     return result
 
 
 def aes_encrypt(key, plaintext):
     iv = os.urandom(16)
     padder = aes_padding.PKCS7(128).padder()
-    padded = padder.update(plaintext.encode()) + padder.finalize()
-    enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
-    return base64.b64encode(iv + enc.update(padded) + enc.finalize()).decode()
+    padded = padder.update(plaintext.encode("utf-8")) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    return base64.b64encode(iv + ciphertext).decode("ascii")
 
 
-def aes_decrypt(key, blob_b64):
-    raw = base64.b64decode(blob_b64)
-    iv, ciphertext = raw[:16], raw[16:]
-    dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
-    padded = dec.update(ciphertext) + dec.finalize()
+def aes_decrypt(key, encrypted_text):
+    raw = base64.b64decode(encrypted_text)
+    if len(raw) < 32 or len(raw) % 16 != 0:
+        raise ValueError("Invalid AES data")
+
+    iv = raw[:16]
+    ciphertext = raw[16:]
+    decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+    padded = decryptor.update(ciphertext) + decryptor.finalize()
     unpadder = aes_padding.PKCS7(128).unpadder()
-    return (unpadder.update(padded) + unpadder.finalize()).decode()
+    plaintext = unpadder.update(padded) + unpadder.finalize()
+    return plaintext.decode("utf-8")
 
 
+def print_status(packet):
+    if packet is None:
+        print("The server disconnected.")
+        return False
+
+    if packet[0] == "SC":
+        print("SC", "|".join(packet[1:]))
+        return True
+
+    if packet[0] == "EE":
+        code = packet[1] if len(packet) > 1 else "?"
+        description = "|".join(packet[2:])
+        print("EE", code, description)
+        return False
+
+    print("Unexpected packet:", packet)
+    return False
 
 
-host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
-sock = socket.create_connection((host, port))
+def main():
+    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
 
-# ---- Setup Phase ----
-secure = input("Use encryption? (y/n): ").strip().lower() == "y"
-send_packet(sock, "SS", "RFMP", "v1.0", "1" if secure else "0")
-packet = recv_packet(sock)                 # (CC) or (CC, server_public_key)
+    sock = socket.create_connection((host, port))
 
-cipher_name = None
-session_key = None
+    try:
+        # ---------- Setup phase ----------
+        secure = input("Use encryption? (y/n): ").strip().lower() == "y"
+        cipher_name = None
+        session_key = None
+        my_public_key_text = None
 
-if secure:
-    cipher_name = "AES" if input("Cipher (AES/Caesar): ").strip().lower() == "aes" else "Caesar"
+        if secure:
+            choice = input("Cipher (AES/Caesar): ").strip().lower()
+            cipher_name = "AES" if choice == "aes" else "Caesar"
 
-    # AES key = 32 random bytes; Caesar key = a shift number sent as text
-    if cipher_name == "AES":
-        session_key = os.urandom(32)
-        raw_key = session_key
-    else:
-        session_key = 3
-        raw_key = b"3"
+            if cipher_name == "AES":
+                session_key = os.urandom(32)
+                raw_key = session_key
+            else:
+                session_key = 3
+                raw_key = str(session_key).encode("utf-8")
 
-    # Lock the session key with the server's public key so only the server can read it
-    server_public_key = serialization.load_pem_public_key(base64.b64decode(packet[1]))
-    encrypted_key = server_public_key.encrypt(
-        raw_key,
-        rsa_padding.OAEP(mgf=rsa_padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
-    )
+            my_private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+            my_public_key = my_private_key.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            my_public_key_text = base64.b64encode(my_public_key).decode("ascii")
 
-    # Our own public key goes in the same packet, as the spec asks
-    my_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    my_pub_pem = my_private_key.public_key().public_bytes(
-        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    send_packet(sock, "EC", cipher_name, base64.b64encode(encrypted_key).decode(),
-                base64.b64encode(my_pub_pem).decode())
-
-
-def encrypt(text):
-    if not secure:
-        return text
-    return aes_encrypt(session_key, text) if cipher_name == "AES" else caesar(text, session_key)
-
-
-def decrypt(text):
-    if not secure:
-        return text
-    return aes_decrypt(session_key, text) if cipher_name == "AES" else caesar(text, -session_key)
-
-
-def read_reply():
-    """Print the server's answer. A DP (file data) may come before the SC/EE."""
-    packet = recv_packet(sock)
-    if packet[0] == "DP":
-        print(decrypt(packet[1]))
+        send_packet(sock, "SS", "RFMP", "v1.0", "1" if secure else "0")
         packet = recv_packet(sock)
-    print(packet[0], "|".join(packet[1:]))
+
+        if packet is None or packet[0] == "EE":
+            print_status(packet)
+            return
+
+        if not secure:
+            if packet != ["CC"]:
+                print("Invalid confirmation packet from server")
+                return
+        else:
+            if len(packet) != 2 or packet[0] != "CC":
+                print("Invalid secure confirmation packet from server")
+                return
+
+            server_public_key = serialization.load_pem_public_key(
+                base64.b64decode(packet[1])
+            )
+            encrypted_key = server_public_key.encrypt(
+                raw_key,
+                rsa_padding.OAEP(
+                    mgf=rsa_padding.MGF1(hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None,
+                ),
+            )
+
+            username = input("Username: ").strip() or "student"
+            credentials = username + ":" + my_public_key_text
+            send_packet(
+                sock,
+                "EC",
+                cipher_name,
+                base64.b64encode(encrypted_key).decode("ascii"),
+                credentials,
+            )
+
+        def encrypt(text):
+            if not secure:
+                return text
+            if cipher_name == "AES":
+                return aes_encrypt(session_key, text)
+            return caesar(text, session_key)
+
+        def decrypt(text):
+            if not secure:
+                return text
+            if cipher_name == "AES":
+                return aes_decrypt(session_key, text)
+            return caesar(text, -session_key)
+
+        def read_reply(expect_file_data=False):
+            packet = recv_packet(sock)
+            if packet is None:
+                print("The server disconnected.")
+                return False
+
+            if packet[0] == "DP":
+                if not expect_file_data:
+                    print("Unexpected DP packet")
+                    return False
+
+                file_data = "|".join(packet[1:])
+                print("--- File contents ---")
+                print(decrypt(file_data))
+                print("--- End of file ---")
+                packet = recv_packet(sock)
+
+            return print_status(packet)
+
+        print("Commands: mkdir, cd, rmdir/rd, del, ren, ls, pwd, whoami, hostname, date")
+        print("File commands: openRead filename, openWrite filename")
+        print("Type exit to close the connection.")
+
+        while True:
+            line = input("rfmp> ").strip()
+
+            if line == "exit":
+                send_packet(sock, "End")
+                break
+
+            if line.startswith("openRead "):
+                filename = line.split(" ", 1)[1]
+                send_packet(sock, "CM", "openRead", filename)
+                read_reply(expect_file_data=True)
+
+            elif line.startswith("openWrite "):
+                filename = line.split(" ", 1)[1]
+                send_packet(sock, "CM", "openWrite", filename)
+
+                if read_reply():
+                    content = input("content: ")
+                    send_packet(sock, "DP", encrypt(content))
+                    read_reply()
+
+            elif line:
+                send_packet(sock, "CM", "prompt", line)
+                read_reply()
+
+    except (OSError, ValueError) as error:
+        print("Connection error:", error)
+    finally:
+        sock.close()
 
 
-# ---- Operation Phase ----
-while True:
-    line = input("rfmp> ").strip()
-
-    if line == "exit":
-        send_packet(sock, "End")           # ---- Closing Phase ----
-        break
-
-    elif line.startswith("openRead "):
-        send_packet(sock, "CM", "openRead", line.split(" ", 1)[1])
-        read_reply()
-
-    elif line.startswith("openWrite "):
-        send_packet(sock, "CM", "openWrite", line.split(" ", 1)[1])
-        read_reply()
-        send_packet(sock, "DP", encrypt(input("content: ")))
-        read_reply()
-
-    elif line:
-        send_packet(sock, "CM", "prompt", line)
-        read_reply()
-
-sock.close()
+if __name__ == "__main__":
+    main()
