@@ -1,154 +1,303 @@
-
-
 import socket
 import struct
 import threading
 import subprocess
 import base64
 import os
+import shlex
+import sys
 
-from cryptography.hazmat.primitives.asymmetric import rsa, padding as rsa_padding 
-from cryptography.hazmat.primitives import hashes, serialization  
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as rsa_padding
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as aes_padding
 
 
-
-
 def send_packet(conn, *fields):
-    payload = "|".join(fields).encode()
+    payload = "|".join(fields).encode("utf-8")
     conn.sendall(struct.pack("!I", len(payload)) + payload)
 
 
-def recv_packet(conn):
-    header = conn.recv(4)
-    if len(header) < 4:
-        return None
-    length = struct.unpack("!I", header)[0]
+def recv_exact(conn, amount):
+    """Receive exactly the requested number of bytes."""
     data = b""
-    while len(data) < length:
-        chunk = conn.recv(length - len(data))
+    while len(data) < amount:
+        chunk = conn.recv(amount - len(data))
         if not chunk:
             return None
         data += chunk
-    return data.decode().split("|")
+    return data
 
 
+def recv_packet(conn):
+    header = recv_exact(conn, 4)
+    if header is None:
+        return None
+
+    length = struct.unpack("!I", header)[0]
+    data = recv_exact(conn, length)
+    if data is None:
+        return None
+    return data.decode("utf-8").split("|")
 
 
 def caesar(text, shift):
     result = ""
     for ch in text:
-        if ch.isalpha():
-            base = ord('A') if ch.isupper() else ord('a')
-            ch = chr((ord(ch) - base + shift) % 26 + base)
-        result += ch
+        if "A" <= ch <= "Z":
+            result += chr((ord(ch) - ord("A") + shift) % 26 + ord("A"))
+        elif "a" <= ch <= "z":
+            result += chr((ord(ch) - ord("a") + shift) % 26 + ord("a"))
+        else:
+            result += ch
     return result
 
 
 def aes_encrypt(key, plaintext):
     iv = os.urandom(16)
     padder = aes_padding.PKCS7(128).padder()
-    padded = padder.update(plaintext.encode()) + padder.finalize()
-    enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
-    return base64.b64encode(iv + enc.update(padded) + enc.finalize()).decode()
+    padded = padder.update(plaintext.encode("utf-8")) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    return base64.b64encode(iv + ciphertext).decode("ascii")
 
 
-def aes_decrypt(key, blob_b64):
-    raw = base64.b64decode(blob_b64)
-    iv, ciphertext = raw[:16], raw[16:]
-    dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
-    padded = dec.update(ciphertext) + dec.finalize()
+def aes_decrypt(key, encrypted_text):
+    raw = base64.b64decode(encrypted_text)
+    if len(raw) < 32 or len(raw) % 16 != 0:
+        raise ValueError("Invalid AES data")
+
+    iv = raw[:16]
+    ciphertext = raw[16:]
+    decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+    padded = decryptor.update(ciphertext) + decryptor.finalize()
     unpadder = aes_padding.PKCS7(128).unpadder()
-    return (unpadder.update(padded) + unpadder.finalize()).decode()
+    plaintext = unpadder.update(padded) + unpadder.finalize()
+    return plaintext.decode("utf-8")
 
 
-# ---------- one client connection ----------
+def make_path(current_folder, name):
+    return os.path.abspath(os.path.join(current_folder, name))
+
+
+def run_prompt(command_text, current_folder):
+    parts = shlex.split(command_text)
+    if not parts:
+        raise ValueError("Empty command")
+
+    command = parts[0].lower()
+    arguments = parts[1:]
+
+    if command == "mkdir" and len(arguments) == 1:
+        os.mkdir(make_path(current_folder, arguments[0]))
+        return current_folder, "folder created"
+
+    if command == "cd" and len(arguments) == 1:
+        new_folder = make_path(current_folder, arguments[0])
+        if not os.path.isdir(new_folder):
+            raise FileNotFoundError("Folder does not exist")
+        return new_folder, "current folder changed"
+
+    if command in ("rmdir", "rd") and len(arguments) == 1:
+        folder = make_path(current_folder, arguments[0])
+        os.rmdir(folder)
+        return current_folder, "folder removed"
+
+    if command == "del" and len(arguments) == 1:
+        os.remove(make_path(current_folder, arguments[0]))
+        return current_folder, "file deleted"
+
+    if command == "ren" and len(arguments) == 2:
+        old_name = make_path(current_folder, arguments[0])
+        new_name = make_path(current_folder, arguments[1])
+        os.rename(old_name, new_name)
+        return current_folder, "file or folder renamed"
+
+    # Five additional prompt commands.
+    if command in ("ls", "dir") and len(arguments) == 0:
+        names = os.listdir(current_folder)
+        return current_folder, "\n".join(names) if names else "(empty folder)"
+
+    if command == "pwd" and len(arguments) == 0:
+        return current_folder, current_folder
+
+    if command in ("whoami", "hostname", "date") and len(arguments) == 0:
+        system_command = [command]
+        if os.name == "nt" and command == "date":
+            system_command = ["cmd", "/c", "date", "/t"]
+
+        result = subprocess.run(
+            system_command,
+            cwd=current_folder,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "Command failed")
+        return current_folder, result.stdout.strip()
+
+    raise ValueError("Unknown command or wrong number of arguments")
+
 
 def handle_client(conn, addr):
     print(f"[+] {addr} connected")
+    current_folder = os.getcwd()
 
-    # ---- Setup Phase ----
-    packet = recv_packet(conn)             # (SS, RFMP, v1.0, 0|1)
-    secure = packet[3] == "1"
-    cipher_name = None
-    session_key = None
-
-    if secure:
-        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        pub_pem = private_key.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        send_packet(conn, "CC", base64.b64encode(pub_pem).decode())
-
-        packet = recv_packet(conn)         # (EC, Algorithm, enc_session_key, credentials)
-        cipher_name = packet[1]
-        session_key = private_key.decrypt(
-            base64.b64decode(packet[2]),
-            rsa_padding.OAEP(mgf=rsa_padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
-        )
-        if cipher_name == "Caesar":
-            session_key = int(session_key.decode())
-    else:
-        send_packet(conn, "CC")
-
-    def decrypt(text):
-        if not secure:
-            return text
-        return aes_decrypt(session_key, text) if cipher_name == "AES" else caesar(text, -session_key)
-
-    def encrypt(text):
-        if not secure:
-            return text
-        return aes_encrypt(session_key, text) if cipher_name == "AES" else caesar(text, session_key)
-
-    # ---- Operation Phase + Closing Phase ----
-    pending_write_file = None
-    while True:
+    try:
+        # ---------- Setup phase ----------
         packet = recv_packet(conn)
-        if packet is None or packet[0] == "End":
-            break
+        valid_start = (
+            packet is not None
+            and len(packet) == 4
+            and packet[0] == "SS"
+            and packet[1] == "RFMP"
+            and packet[2] == "v1.0"
+            and packet[3] in ("0", "1")
+        )
+        if not valid_start:
+            send_packet(conn, "EE", "1", "invalid Start packet")
+            return
 
-        ptype = packet[0]
-        try:
-            if ptype == "CM":
-                cmd_type, arg = packet[1], "|".join(packet[2:])
+        secure = packet[3] == "1"
+        cipher_name = None
+        session_key = None
 
-                if cmd_type == "prompt":
-                    result = subprocess.run(arg, shell=True, capture_output=True, text=True, timeout=15)
-                    send_packet(conn, "SC", (result.stdout or result.stderr or "OK").strip())
+        if secure:
+            private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+            public_key = private_key.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            send_packet(conn, "CC", base64.b64encode(public_key).decode("ascii"))
 
-                elif cmd_type == "openRead":
-                    if not os.path.isfile(arg):
-                        send_packet(conn, "EE", "2", "file not found: " + arg)
-                    else:
-                        content = open(arg, "r", encoding="utf-8").read()
+            packet = recv_packet(conn)
+            if packet is None or len(packet) != 4 or packet[0] != "EC":
+                send_packet(conn, "EE", "1", "expected Encryption packet")
+                return
+
+            cipher_name = packet[1]
+            if cipher_name not in ("AES", "Caesar"):
+                send_packet(conn, "EE", "4", "invalid encryption algorithm")
+                return
+
+            username, client_public_key_text = packet[3].split(":", 1)
+
+            raw_key = private_key.decrypt(
+                base64.b64decode(packet[2]),
+                rsa_padding.OAEP(
+                    mgf=rsa_padding.MGF1(hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None,
+                ),
+            )
+
+            if cipher_name == "AES":
+                session_key = raw_key
+            else:
+                session_key = int(raw_key.decode("utf-8"))
+        else:
+            send_packet(conn, "CC")
+
+        def decrypt(text):
+            if not secure:
+                return text
+            if cipher_name == "AES":
+                return aes_decrypt(session_key, text)
+            return caesar(text, -session_key)
+
+        def encrypt(text):
+            if not secure:
+                return text
+            if cipher_name == "AES":
+                return aes_encrypt(session_key, text)
+            return caesar(text, session_key)
+
+        # ---------- Operation and closing phases ----------
+        pending_write_file = None
+
+        while True:
+            packet = recv_packet(conn)
+            if packet is None:
+                break
+
+            if packet == ["End"]:
+                break
+
+            packet_type = packet[0]
+
+            try:
+                if packet_type == "CM":
+                    if len(packet) < 3:
+                        send_packet(conn, "EE", "1", "invalid Command packet")
+                        continue
+
+                    if pending_write_file is not None:
+                        send_packet(conn, "EE", "1", "send DP to finish openWrite")
+                        continue
+
+                    command_type = packet[1]
+                    argument = "|".join(packet[2:])
+
+                    if command_type == "prompt":
+                        current_folder, result = run_prompt(argument, current_folder)
+                        send_packet(conn, "SC", result)
+
+                    elif command_type == "openRead":
+                        filename = make_path(current_folder, argument)
+                        if not os.path.isfile(filename):
+                            send_packet(conn, "EE", "3", "file not found: " + argument)
+                            continue
+
+                        with open(filename, "r", encoding="utf-8") as file:
+                            content = file.read()
                         send_packet(conn, "DP", encrypt(content))
                         send_packet(conn, "SC", "openRead complete")
 
-                elif cmd_type == "openWrite":
-                    pending_write_file = arg
-                    send_packet(conn, "SC", "ready to receive data")
+                    elif command_type == "openWrite":
+                        filename = make_path(current_folder, argument)
+                        with open(filename, "w", encoding="utf-8"):
+                            pass
+                        pending_write_file = filename
+                        send_packet(conn, "SC", "ready to receive data")
 
-                else:
-                    send_packet(conn, "EE", "1", "unknown command: " + cmd_type)
+                    else:
+                        send_packet(conn, "EE", "2", "unknown command: " + command_type)
 
-            elif ptype == "DP":
-                if pending_write_file is None:
-                    send_packet(conn, "EE", "3", "no openWrite pending")
-                else:
-                    open(pending_write_file, "w", encoding="utf-8").write(decrypt(packet[1]))
-                    send_packet(conn, "SC", "file written")
+                elif packet_type == "DP":
+                    if pending_write_file is None:
+                        send_packet(conn, "EE", "1", "no openWrite pending")
+                        continue
+
+                    file_data = "|".join(packet[1:])
+                    content = decrypt(file_data)
+                    with open(pending_write_file, "w", encoding="utf-8") as file:
+                        file.write(content)
+
                     pending_write_file = None
+                    send_packet(conn, "SC", "file written")
 
-            else:
-                send_packet(conn, "EE", "1", "unknown packet type: " + ptype)
+                else:
+                    send_packet(conn, "EE", "1", "unknown packet type: " + packet_type)
 
-        except Exception as e:
-            send_packet(conn, "EE", "4", str(e))
+            except (OSError, PermissionError) as error:
+                send_packet(conn, "EE", "3", str(error))
+            except (ValueError, UnicodeError) as error:
+                send_packet(conn, "EE", "2", str(error))
+            except Exception as error:
+                send_packet(conn, "EE", "4", str(error))
 
-    conn.close()
-    print(f"[-] {addr} disconnected")
+    except Exception as error:
+        try:
+            send_packet(conn, "EE", "4", str(error))
+        except OSError:
+            pass
+    finally:
+        conn.close()
+        print(f"[-] {addr} disconnected")
 
 
 def main(host="0.0.0.0", port=5000):
@@ -158,13 +307,22 @@ def main(host="0.0.0.0", port=5000):
     server_sock.listen(5)
     print(f"RFMP server listening on {host}:{port}")
 
-    while True:
-        conn, addr = server_sock.accept()
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+    try:
+        while True:
+            conn, addr = server_sock.accept()
+            thread = threading.Thread(
+                target=handle_client,
+                args=(conn, addr),
+                daemon=True,
+            )
+            thread.start()
+    except KeyboardInterrupt:
+        print("\nServer stopped")
+    finally:
+        server_sock.close()
 
 
 if __name__ == "__main__":
-    import sys
-    h = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
-    p = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
-    main(h, p)
+    selected_host = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
+    selected_port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
+    main(selected_host, selected_port)
