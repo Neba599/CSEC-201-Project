@@ -247,6 +247,10 @@ def handle_client(conn, addr):
                 session_key = raw_key
             else:
                 session_key = int(raw_key.decode("utf-8"))
+
+            # tell the client the key exchange worked. If anything above
+            # failed, the except at the bottom sends EE 4 instead.
+            send_packet(conn, "SC", "secure session ready")
         else:
             # not secured: CC packet with just one field
             send_packet(conn, "CC")
