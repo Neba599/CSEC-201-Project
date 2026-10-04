@@ -3,6 +3,7 @@ import struct
 import base64
 import os
 import sys
+import random
 
 # cryptography library: RSA for sending the session key, AES for the file data
 from cryptography.hazmat.primitives.asymmetric import rsa, padding as rsa_padding
@@ -138,8 +139,9 @@ def main():
                 session_key = os.urandom(32)
                 raw_key = session_key
             else:
-                # Caesar key is just the shift amount
-                session_key = 3
+                # Caesar key is just the shift amount, random from 1 to 25
+                # (0 or 26 would not change the text at all)
+                session_key = random.randint(1, 25)
                 raw_key = str(session_key).encode("utf-8")
 
             # the client's own RSA key pair. The spec says to send our public
@@ -200,6 +202,10 @@ def main():
                 base64.b64encode(encrypted_key).decode("ascii"),
                 credentials,
             )
+            # server replies SC if it decrypted the session key, EE if not.
+            # If the key exchange failed there's no point going on.
+            if not print_status(recv_packet(sock)):
+                return
 
         # helpers for the DP text field: use the session key if secured,
         # otherwise just pass the text through
@@ -266,13 +272,27 @@ def main():
                 read_reply(expect_file_data=True)
 
             # openWrite <file>: CM|openWrite|<file>, and if the server says
-            # SC we send the content in a DP packet (encrypted if secured)
+            # SC we send the content in one DP packet (encrypted if secured)
             elif line.startswith("openWrite "):
                 filename = line.split(" ", 1)[1]
                 send_packet(sock, "CM", "openWrite", filename)
 
                 if read_reply():
-                    content = input("content: ")
+                    # read lines until the user types a "." on its own line,
+                    # so files can have more than one line
+                    print("Type the file content. End with a line containing only .")
+                    lines = []
+                    while True:
+                        try:
+                            content_line = input("content> ")
+                        except (EOFError, KeyboardInterrupt):
+                            # Ctrl+D / Ctrl+C here just ends the content
+                            print()
+                            break
+                        if content_line == ".":
+                            break
+                        lines.append(content_line)
+                    content = "\n".join(lines)
                     send_packet(sock, "DP", encrypt(content))
                     read_reply()
 
