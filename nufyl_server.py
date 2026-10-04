@@ -201,8 +201,7 @@ def handle_client(conn, addr):
             # Send server public key packet (CC) base64 encoded
             send_packet(conn, "CC", base64.b64encode(public_key).decode("ascii"))
 
-            # Receive Encryption Confirmation packet (EC) from client
-            packet = recv_packet(conn)
+# Receive Encryption packet (EC): algorithm, RSA-encrypted session key, username:client_public_key            packet = recv_packet(conn)
             if packet is None or len(packet) != 4 or packet[0] != "EC":
                 send_packet(conn, "EE", "1", "expected Encryption packet")
                 return
