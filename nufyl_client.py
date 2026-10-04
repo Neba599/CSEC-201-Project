@@ -247,8 +247,12 @@ def main():
         print("Type exit to close the connection.")
 
         while True:
-            line = input("rfmp> ").strip()
-
+            try:
+                line = input("rfmp> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                # Ctrl+D / Ctrl+C: still send End so the server knows we're done
+                print()
+                line = "exit"
             # ---------- Closing phase ----------
             # send End so the server knows we're done, then close
             if line == "exit":
